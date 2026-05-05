@@ -8,12 +8,10 @@ import (
 	"time"
 )
 
-// ─── Benchmark fixtures ───────────────────────────────────────────────────────
+// ─── Fixtures ─────────────────────────────────────────────────────────────────
 
-// smallPayload is a realistic 5-code blob (~40 bytes).
 var smallPayload = []byte("AU_ieu13\n103956\nghgqb\n10002\na012ne")
 
-// largePayload is 1 000 unique codes joined by newlines.
 var largePayload = func() []byte {
 	codes := make([]string, 1000)
 	for i := range codes {
@@ -22,13 +20,11 @@ var largePayload = func() []byte {
 	return []byte(strings.Join(codes, "\n"))
 }()
 
-// warmAnalyser returns an analyser pre-seeded with all keys so subsequent
-// benchmarks exercise the fast (read-lock + atomic) path, not the slow path.
-func warmAnalyser(b *testing.B, workers, bufSize int) DataExporter {
+func warmAnalyser(b *testing.B, bufSize int) DataExporter {
 	b.Helper()
-	a := New(context.Background(), workers, bufSize)
+	a := New(context.Background(), 0, bufSize)
 	a.Analyse(largePayload)
-	time.Sleep(50 * time.Millisecond) // let workers process
+	time.Sleep(150 * time.Millisecond) // let consumer + snapshot settle
 	b.ResetTimer()
 	return a
 }
@@ -44,34 +40,30 @@ func shutdownB(b *testing.B, a DataExporter) {
 // ─── Analyse benchmarks ───────────────────────────────────────────────────────
 
 // BenchmarkAnalyse_Small measures the hotpath for a small (5-code) payload.
-// We expect 0 allocs/op once the pool is warmed up.
+// Expected: 0 allocs/op once pool is warmed up.
 func BenchmarkAnalyse_Small(b *testing.B) {
-	a := warmAnalyser(b, 4, 1<<16)
+	a := warmAnalyser(b, 1<<16)
 	defer shutdownB(b, a)
-
 	b.ReportAllocs()
 	for i := 0; i < b.N; i++ {
 		a.Analyse(smallPayload)
 	}
 }
 
-// BenchmarkAnalyse_Large measures the hotpath for a large (1 000-code) payload.
+// BenchmarkAnalyse_Large measures the hotpath for a 1000-code payload.
 func BenchmarkAnalyse_Large(b *testing.B) {
-	a := warmAnalyser(b, 4, 1<<16)
+	a := warmAnalyser(b, 1<<16)
 	defer shutdownB(b, a)
-
 	b.ReportAllocs()
 	for i := 0; i < b.N; i++ {
 		a.Analyse(largePayload)
 	}
 }
 
-// BenchmarkAnalyse_Parallel models 100 goroutines hammering Analyse concurrently.
-// This is the closest simulation to production load.
+// BenchmarkAnalyse_Parallel models 100 concurrent goroutines on the hotpath.
 func BenchmarkAnalyse_Parallel(b *testing.B) {
-	a := warmAnalyser(b, 8, 1<<16)
+	a := warmAnalyser(b, 1<<16)
 	defer shutdownB(b, a)
-
 	b.ReportAllocs()
 	b.SetParallelism(100)
 	b.RunParallel(func(pb *testing.PB) {
@@ -81,19 +73,14 @@ func BenchmarkAnalyse_Parallel(b *testing.B) {
 	})
 }
 
-// BenchmarkAnalyse_ZeroAlloc verifies the 0-alloc contract.
-// Run with: go test -bench=BenchmarkAnalyse_ZeroAlloc -benchmem
-// Expected: 0 allocs/op after pool warm-up.
+// BenchmarkAnalyse_ZeroAlloc verifies the 0-alloc contract on the hotpath.
 func BenchmarkAnalyse_ZeroAlloc(b *testing.B) {
-	a := warmAnalyser(b, 4, 1<<16)
+	a := warmAnalyser(b, 1<<16)
 	defer shutdownB(b, a)
-
 	b.ReportAllocs()
 	for i := 0; i < b.N; i++ {
 		a.Analyse(smallPayload)
 	}
-
-	// Fail the benchmark if allocations are detected.
 	result := testing.Benchmark(func(b *testing.B) {
 		b.ReportAllocs()
 		for i := 0; i < b.N; i++ {
@@ -105,99 +92,73 @@ func BenchmarkAnalyse_ZeroAlloc(b *testing.B) {
 	}
 }
 
-// ─── Process benchmarks ───────────────────────────────────────────────────────
-
-// BenchmarkProcess isolates the parser + counter update path (no channel overhead).
-func BenchmarkProcess_Small(b *testing.B) {
-	a := warmAnalyser(b, 1, 1).(*analyser)
-	defer shutdownB(b, a)
-
-	b.ReportAllocs()
-	for i := 0; i < b.N; i++ {
-		a.process(smallPayload)
-	}
-}
-
-func BenchmarkProcess_Large(b *testing.B) {
-	a := warmAnalyser(b, 1, 1).(*analyser)
-	defer shutdownB(b, a)
-
-	b.ReportAllocs()
-	for i := 0; i < b.N; i++ {
-		a.process(largePayload)
-	}
-}
-
 // ─── GetCurrentCounts benchmarks ─────────────────────────────────────────────
 
+// BenchmarkGetCurrentCounts_Small measures lock-free snapshot read (small map).
 func BenchmarkGetCurrentCounts_Small(b *testing.B) {
-	a := warmAnalyser(b, 4, 1<<14)
+	a := warmAnalyser(b, 1<<14)
 	defer shutdownB(b, a)
-
 	b.ReportAllocs()
 	for i := 0; i < b.N; i++ {
 		_ = a.GetCurrentCounts()
 	}
 }
 
+// BenchmarkGetCurrentCounts_Large measures snapshot read with 1000 keys.
 func BenchmarkGetCurrentCounts_Large(b *testing.B) {
-	a := New(context.Background(), 4, 1<<14)
-	// Seed with 1 000 unique keys.
+	a := New(context.Background(), 0, 1<<14)
 	a.Analyse(largePayload)
-	time.Sleep(50 * time.Millisecond)
+	time.Sleep(150 * time.Millisecond)
 	b.ResetTimer()
 	defer shutdownB(b, a)
-
 	b.ReportAllocs()
 	for i := 0; i < b.N; i++ {
 		_ = a.GetCurrentCounts()
 	}
 }
 
-// ─── Increment benchmarks ─────────────────────────────────────────────────────
+// ─── Bloom filter benchmarks ──────────────────────────────────────────────────
 
-// BenchmarkIncrement_Existing measures the fast path (key already present).
-func BenchmarkIncrement_Existing(b *testing.B) {
-	a := warmAnalyser(b, 1, 1).(*analyser)
-	defer shutdownB(b, a)
-
+// BenchmarkBloom_MayContain measures the bloom filter check path (no lock).
+func BenchmarkBloom_MayContain(b *testing.B) {
+	var f bloomFilter
 	key := []byte("AU_ieu13")
+	h1, h2 := hash128(key)
+	f.add(h1, h2)
 	b.ReportAllocs()
+	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		a.increment(key)
+		_ = f.mayContain(h1, h2)
 	}
 }
 
-// BenchmarkIncrement_New measures the slow path (first-time key insertion).
-func BenchmarkIncrement_New(b *testing.B) {
-	a := New(context.Background(), 1, 1).(*analyser)
-	defer shutdownB(b, a)
-
+// BenchmarkBloom_Add measures the bloom filter insert path.
+func BenchmarkBloom_Add(b *testing.B) {
+	var f bloomFilter
 	b.ReportAllocs()
 	for i := 0; i < b.N; i++ {
-		key := []byte(fmt.Sprintf("newkey-%d", i))
-		a.increment(key)
+		key := []byte(fmt.Sprintf("key-%d", i))
+		h1, h2 := hash128(key)
+		f.add(h1, h2)
 	}
 }
 
-// ─── FNV hash benchmark ───────────────────────────────────────────────────────
+// ─── Hash benchmarks ──────────────────────────────────────────────────────────
 
-func BenchmarkFNV32(b *testing.B) {
+func BenchmarkHash128(b *testing.B) {
 	key := []byte("AU_ieu13")
 	b.ReportAllocs()
 	for i := 0; i < b.N; i++ {
-		_ = fnv32(key)
+		_, _ = hash128(key)
 	}
 }
 
 // ─── End-to-end throughput ────────────────────────────────────────────────────
 
-// BenchmarkE2E_Throughput measures the full pipeline: Analyse → worker → counter.
-// It reports operations per second under sustained parallel load.
+// BenchmarkE2E_Throughput measures sustained parallel hotpath throughput.
 func BenchmarkE2E_Throughput(b *testing.B) {
-	a := warmAnalyser(b, 8, 1<<16)
+	a := warmAnalyser(b, 1<<16)
 	defer shutdownB(b, a)
-
 	b.ReportAllocs()
 	b.SetParallelism(100)
 	b.RunParallel(func(pb *testing.PB) {

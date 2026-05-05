@@ -61,8 +61,8 @@ func TestAnalyse_SingleBlob(t *testing.T) {
 	a := newAnalyser(t)
 	a.Analyse([]byte("AU_ieu13\n103956\nghgqb\n10002\na012ne"))
 
-	// Give the worker time to process.
-	time.Sleep(20 * time.Millisecond)
+	// Snapshot refreshes every 100ms; wait long enough to guarantee a refresh.
+	time.Sleep(250 * time.Millisecond)
 
 	counts := a.GetCurrentCounts()
 	want := []string{"AU_ieu13", "103956", "ghgqb", "10002", "a012ne"}
@@ -81,7 +81,7 @@ func TestAnalyse_EmptyInput(t *testing.T) {
 	a.Analyse(nil)
 	a.Analyse([]byte{})
 	a.Analyse([]byte("\n\n\n"))
-	time.Sleep(20 * time.Millisecond)
+	time.Sleep(250 * time.Millisecond)
 	if n := len(a.GetCurrentCounts()); n != 0 {
 		t.Errorf("expected 0 keys for empty/blank input, got %d", n)
 	}
@@ -90,7 +90,7 @@ func TestAnalyse_EmptyInput(t *testing.T) {
 func TestAnalyse_TrailingNewline(t *testing.T) {
 	a := newAnalyser(t)
 	a.Analyse([]byte("foo\nbar\n"))
-	time.Sleep(20 * time.Millisecond)
+	time.Sleep(250 * time.Millisecond)
 	counts := a.GetCurrentCounts()
 	if counts["foo"] != 1 || counts["bar"] != 1 || len(counts) != 2 {
 		t.Errorf("unexpected counts: %v", counts)
@@ -100,7 +100,7 @@ func TestAnalyse_TrailingNewline(t *testing.T) {
 func TestAnalyse_SingleToken(t *testing.T) {
 	a := newAnalyser(t)
 	a.Analyse([]byte("onlyone"))
-	time.Sleep(20 * time.Millisecond)
+	time.Sleep(250 * time.Millisecond)
 	counts := a.GetCurrentCounts()
 	if counts["onlyone"] != 1 {
 		t.Errorf("want counts[onlyone]=1, got %d", counts["onlyone"])
@@ -110,7 +110,7 @@ func TestAnalyse_SingleToken(t *testing.T) {
 func TestGetCurrentCounts_DoesNotReset(t *testing.T) {
 	a := newAnalyser(t)
 	a.Analyse([]byte("x\ny"))
-	time.Sleep(20 * time.Millisecond)
+	time.Sleep(250 * time.Millisecond)
 	c1 := a.GetCurrentCounts()
 	c2 := a.GetCurrentCounts()
 	if c1["x"] != c2["x"] || c1["y"] != c2["y"] {
@@ -291,7 +291,7 @@ func TestAnalyse_BinaryGarbage(t *testing.T) {
 	a := newAnalyser(t)
 	// Non-UTF-8 bytes should not panic — keys are raw bytes.
 	a.Analyse([]byte{0xFF, 0xFE, '\n', 0x00, 0x01})
-	time.Sleep(20 * time.Millisecond)
+	time.Sleep(250 * time.Millisecond)
 	counts := a.GetCurrentCounts()
 	if len(counts) == 0 {
 		t.Error("expected at least one key from binary input")
@@ -302,7 +302,7 @@ func TestAnalyse_VeryLongToken(t *testing.T) {
 	a := newAnalyser(t)
 	long := strings.Repeat("a", 1<<16)
 	a.Analyse([]byte(long))
-	time.Sleep(20 * time.Millisecond)
+	time.Sleep(250 * time.Millisecond)
 	counts := a.GetCurrentCounts()
 	if counts[long] != 1 {
 		t.Errorf("want counts[long]=1, got %d", counts[long])
@@ -311,17 +311,19 @@ func TestAnalyse_VeryLongToken(t *testing.T) {
 
 // ─── Internal helpers ─────────────────────────────────────────────────────────
 
-func TestShardIndex_Distribution(t *testing.T) {
+func TestHash128_Distribution(t *testing.T) {
 	seen := make(map[int]int)
-	for i := 0; i < 1000; i++ {
+	for i := 0; i < 10000; i++ {
 		key := []byte(fmt.Sprintf("key-%d", i))
-		idx := shardIndex(key)
+		h1, _ := hash128(key)
+		idx := int(h1) & (numShards - 1)
 		if idx < 0 || idx >= numShards {
 			t.Fatalf("shard index %d out of range [0,%d)", idx, numShards)
 		}
 		seen[idx]++
 	}
-	// All shards should receive at least a few keys (rough distribution check).
+	// With 10 000 keys across 256 shards, expect ~39 per shard on average.
+	// Any shard with 0 means the hash is severely skewed.
 	for s, count := range seen {
 		if count == 0 {
 			t.Errorf("shard %d received no keys — hash distribution is skewed", s)
@@ -349,15 +351,15 @@ var _ DataExporter = (*analyser)(nil)
 // ─── Atomic counter correctness ───────────────────────────────────────────────
 
 func TestAtomicCounter_ExactCount(t *testing.T) {
-	const workers = 8
+	const goroutines = 8
 	const sends = 500
 
-	a := New(context.Background(), workers, 4096)
+	a := New(context.Background(), goroutines, 4096)
 
 	var wg sync.WaitGroup
 	var sent atomic.Int64
-	wg.Add(workers)
-	for i := 0; i < workers; i++ {
+	wg.Add(goroutines)
+	for i := 0; i < goroutines; i++ {
 		go func() {
 			defer wg.Done()
 			for j := 0; j < sends; j++ {
@@ -368,8 +370,8 @@ func TestAtomicCounter_ExactCount(t *testing.T) {
 	}
 	wg.Wait()
 
-	// Wait for all workers to finish.
-	time.Sleep(100 * time.Millisecond)
+	// Wait for consumer to process and snapshot to refresh.
+	time.Sleep(300 * time.Millisecond)
 
 	counts := a.GetCurrentCounts()
 	dropped := a.DroppedCount()
