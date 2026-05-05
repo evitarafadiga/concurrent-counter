@@ -12,26 +12,7 @@ An HTTP server returns blobs of `\n`-delimited unique codes. This package counts
 
 ## Architecture
 
-```
-┌─────────────────────────────── hot path ──────────────────────────────────┐
-│                                                                            │
-│  HTTP Handler ──► Analyse() ──► parse tokens ──► tokenBatch ──► workCh   │
-│                   (non-blocking, fire-and-forget, zero allocs)             │
-└────────────────────────────────────────────────────────────────────────────┘
-                                     │ (buffered channel, non-blocking send)
-                                     ▼
-┌──────────────────────── consumer goroutine (single) ───────────────────────┐
-│                                                                            │
-│  dequeue batch ──► bloom filter ──► shard map update ──► atomic snapshot  │
-│                    (dedup check)    (exclusive writer)    (100ms refresh)  │
-└────────────────────────────────────────────────────────────────────────────┘
-                                     │
-                                     ▼
-┌───────────────────────────── subscribers ──────────────────────────────────┐
-│                                                                            │
-│   1s: snapshot → io.Writer    5s: snapshot → io.Writer    30s: snapshot → │
-└────────────────────────────────────────────────────────────────────────────┘
-```
+![High-level Component Diagram](/Component%20Diagram1.png)
 
 ---
 
